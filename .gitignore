@@ -9,3 +9,4 @@ screenshots/
 *.env
 *secret*
 *secrets*
+.venv-py39-backup/
