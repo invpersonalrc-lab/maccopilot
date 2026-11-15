@@ -19,6 +19,10 @@ class MacCopilotSafetyTests(unittest.TestCase):
         self.press = patch.object(copilot.pyautogui, "press").start()
         self.addCleanup(patch.stopall)
         copilot._ask_times.clear()
+        copilot._agent.update(running=False, state="idle", log=[], question="", action="", steps=0)
+        copilot._agent_stop.clear()
+        copilot._agent_answer.clear()
+        patch.object(copilot, "AGENT_STEP_DELAY_SECONDS", 0).start()
         self.screenshot = patch.object(copilot, "_screenshot_for_model", return_value=("aW1n", 1440, 900)).start()
 
     def ask(self, suggestion, question="How do I open a new tab?"):
@@ -204,6 +208,117 @@ class MacCopilotSafetyTests(unittest.TestCase):
         image, text = kwargs["messages"][0]["content"]
         self.assertEqual(image["source"]["media_type"], "image/png")
         self.assertEqual(text["text"], "open a tab")
+
+
+    # ---- Agent mode ----
+
+    def step(self, status, kind="none", x=0, y=0, value="", question="", explanation="e"):
+        return {"status": status, "explanation": explanation, "question": question, "kind": kind, "x": x, "y": y, "value": value}
+
+    def run_agent(self, decisions, goal="Install VLC"):
+        with patch.object(copilot, "_call_claude_agent", side_effect=decisions) as claude:
+            copilot._agent["running"] = True
+            copilot._agent_loop(goal)
+        return claude
+
+    def test_agent_runs_safe_steps_without_approval_until_done(self):
+        claude = self.run_agent([
+            self.step("act", "click", 100, 200),
+            self.step("act", "type", 300, 40, "videolan.org"),
+            self.step("act", "hotkey", 0, 0, "enter"),
+            self.step("done", explanation="VLC installed"),
+        ])
+        self.assertEqual(claude.call_count, 4)
+        self.assertEqual(self.click.call_args_list, [((100, 200),), ((300, 40),)])
+        self.write.assert_called_once()
+        self.press.assert_called_once_with("enter")
+        self.assertFalse(copilot._agent["running"])
+        self.assertIn("Done: VLC installed", copilot._agent["log"][-1])
+        history = claude.call_args_list[-1].args[1]
+        self.assertTrue(any("videolan.org" in h for h in history))
+
+    def test_agent_never_bypasses_safety_rules(self):
+        self.run_agent([
+            self.step("act", "type", 0, 0, "sudo rm -rf /"),
+            self.step("act", "type", 0, 0, "my password is hunter2"),
+            self.step("act", "hotkey", 0, 0, "command+q"),
+            self.step("act", "click", 9999, 9999),
+            self.step("stuck", explanation="no safe way"),
+        ])
+        self.click.assert_not_called()
+        self.write.assert_not_called()
+        self.hotkey.assert_not_called()
+        self.assertTrue(any("Blocked" in line for line in copilot._agent["log"]))
+
+    def test_agent_pauses_for_person_and_stops_if_declined(self):
+        import threading
+        decisions = [self.step("ask_user", "click", 500, 500, question="This costs $4.99. Buy it?")]
+        with patch.object(copilot, "_call_claude_agent", side_effect=decisions):
+            copilot._agent["running"] = True
+            worker = threading.Thread(target=copilot._agent_loop, args=("buy app",))
+            worker.start()
+            for _ in range(100):
+                if copilot._agent["state"] == "waiting":
+                    break
+                __import__("time").sleep(0.02)
+            self.assertEqual(copilot._agent["question"], "This costs $4.99. Buy it?")
+            self.click.assert_not_called()
+            self.assertEqual(self.client.post("/agent/answer", json={"approve": False}).status_code, 200)
+            worker.join(5)
+        self.click.assert_not_called()
+        self.assertFalse(copilot._agent["running"])
+
+    def test_agent_runs_paused_step_only_after_yes(self):
+        import threading
+        decisions = [self.step("ask_user", "click", 500, 500, question="Allow?"), self.step("done")]
+        with patch.object(copilot, "_call_claude_agent", side_effect=decisions):
+            copilot._agent["running"] = True
+            worker = threading.Thread(target=copilot._agent_loop, args=("g",))
+            worker.start()
+            for _ in range(100):
+                if copilot._agent["state"] == "waiting":
+                    break
+                __import__("time").sleep(0.02)
+            self.click.assert_not_called()
+            self.client.post("/agent/answer", json={"approve": True})
+            worker.join(5)
+        self.click.assert_called_once_with(500, 500)
+
+    def test_agent_stop_and_step_limit(self):
+        copilot._agent_stop.set()
+        claude = self.run_agent([self.step("act", "click", 1, 1)])
+        claude.assert_not_called()
+        self.assertIn("Stopped by you", copilot._agent["log"][-1])
+        copilot._agent_stop.clear()
+        claude = self.run_agent([self.step("act", "click", 10, 10)] * copilot.AGENT_MAX_STEPS)
+        self.assertEqual(claude.call_count, copilot.AGENT_MAX_STEPS)
+        self.assertIn("step limit", copilot._agent["log"][-1])
+
+    def test_agent_emergency_stop_ends_run(self):
+        self.click.side_effect = copilot.pyautogui.FailSafeException("corner")
+        self.run_agent([self.step("act", "click", 10, 10), self.step("act", "click", 20, 20)])
+        self.assertIn("Emergency stop", copilot._agent["log"][-1])
+        self.assertEqual(self.click.call_count, 1)
+
+    def test_agent_respects_hourly_action_limit(self):
+        copilot._action_times.extend([__import__("time").monotonic()] * copilot.MAX_ACTIONS_PER_SESSION)
+        self.run_agent([self.step("act", "click", 10, 10)])
+        self.click.assert_not_called()
+        self.assertIn("limit", copilot._agent["log"][-1])
+
+    def test_agent_endpoints_and_manual_actions_blocked_while_running(self):
+        self.assertEqual(self.client.post("/agent/start", json={"goal": ""}).status_code, 400)
+        copilot._agent["running"] = True
+        self.assertEqual(self.client.post("/agent/start", json={"goal": "x"}).status_code, 409)
+        self.assertEqual(self.propose_click().status_code, 409)
+        self.assertEqual(self.client.post("/agent/answer", json={"approve": True}).status_code, 400)
+        self.assertEqual(self.client.get("/agent/status").json["running"], True)
+        self.client.post("/agent/stop")
+        self.assertTrue(copilot._agent_stop.is_set())
+
+    def test_reject_button_also_stops_agent(self):
+        self.client.post("/reject")
+        self.assertTrue(copilot._agent_stop.is_set())
 
 
 if __name__ == "__main__":
