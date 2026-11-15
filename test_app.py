@@ -93,6 +93,24 @@ class MacCopilotSafetyTests(unittest.TestCase):
         self.assertIn("body:JSON.stringify({token:approvedToken})", script)
         self.assertNotRegex(script, r"(?<![.\w])kind\.value")
 
+    def test_type_and_hotkey_click_target_first_when_given(self):
+        token = self.client.post("/propose", json={"kind": "type", "x": 50, "y": 60, "value": "VLC"}).json
+        self.assertEqual(token["description"], "Click (50, 60), then type: 'VLC'")
+        self.write.assert_not_called()
+        self.client.post("/approve", json={"token": token["token"]})
+        self.click.assert_called_once_with(50, 60)
+        self.write.assert_called_once()
+        self.click.reset_mock()
+        token = self.client.post("/propose", json={"kind": "hotkey", "x": 0, "y": 0, "value": "enter"}).json["token"]
+        self.client.post("/approve", json={"token": token})
+        self.click.assert_not_called()
+        self.press.assert_called_once_with("enter")
+
+    def test_focus_click_outside_display_denied(self):
+        response = self.client.post("/propose", json={"kind": "type", "x": 9999, "y": 60, "value": "VLC"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(copilot.pending, {})
+
     # ---- Ask (Claude-suggested actions) ----
 
     def test_ask_suggestion_never_executes_without_approval(self):
